@@ -84,6 +84,54 @@ Authorization: Bearer <API_TOKEN>
 }
 ```
 
+### `POST /download` — файл по прямой ссылке
+
+Забирает файл через контекст браузера: куки и прокси сохраняются, страница не рендерится.
+
+```json
+{
+  "url": "https://example.com/report.pdf",
+  "timeout_ms": 60000,
+  "b64": false
+}
+```
+
+Ответ по умолчанию — **бинарник** с заголовками `Content-Type` и `Content-Disposition: attachment; filename="..."`. `Content-Type` берётся из ответа сервера, имя файла — из `Content-Disposition`, иначе из пути URL.
+
+### `POST /download-click` — файл после нажатия кнопки
+
+Открывает страницу, кликает по элементу и перехватывает скачивание через `expect_download`.
+
+```json
+{
+  "url": "https://example.com/exports",
+  "selector": "text=Скачать",
+  "wait_ms": 2000,
+  "timeout_ms": 60000,
+  "b64": false
+}
+```
+
+`selector` — любой селектор Playwright: CSS, `text=Скачать`, `xpath=//button`, `role=button[name="Export"]`.
+
+Если скачивание не началось (неверный селектор, таймаут) — вернётся `504` с текстом причины.
+
+### JSON вместо бинарника
+
+Оба эндпоинта принимают `"b64": true` — тогда ответ будет JSON:
+
+```json
+{ "filename": "report.pdf", "content_type": "application/pdf", "size": 84521, "b64": "JVBERi0..." }
+```
+
+Для больших файлов лучше бинарник: base64 раздувает объём на 33%.
+
+### Приём файлов в n8n
+
+Нода **HTTP Request** → **Response Format: File**. Файл окажется в бинарном свойстве `data`, дальше — «Convert to File», «Write Binary File», Telegram, почта, S3.
+
+Лимиты на стороне n8n: `N8N_PAYLOAD_SIZE_MAX` (по умолчанию 16 МБ). На стороне сервиса — `MAX_DOWNLOAD_MB` (по умолчанию 200), при превышении вернётся `413`.
+
 ## Режимы браузера
 
 Управляется переменной `CAMOUFOX_HEADLESS`:
