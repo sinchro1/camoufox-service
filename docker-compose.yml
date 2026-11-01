@@ -1,18 +1,25 @@
 services:
   camoufox:
-    # замените your-github-login на свой логин в нижнем регистре
     image: ghcr.io/sinchro1/camoufox-service:latest
     container_name: camoufox-service
     restart: unless-stopped
-#    ports:
-#      - "8000:8000"
+    # наружу порты не публикуем — доступ только из сети n8n
+    #    ports:
+    #      - "8000:8000"
     environment:
       - API_TOKEN=${API_TOKEN}
       - CAMOUFOX_VIRTUAL_DISPLAY_SIZE=1920x1080x24
       - CAMOUFOX_HEADLESS=virtual
     shm_size: "1gb"
+    networks:
+      - n8n_net
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+networks:
+  n8n_net:
+    external: true
+    name: n8n_default
