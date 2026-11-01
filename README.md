@@ -57,7 +57,10 @@ Authorization: Bearer <API_TOKEN>
 ```json
 {
   "url": "https://example.com",
+  "wait_mode": "smart",
   "wait_ms": 2000,
+  "ready_timeout_ms": 60000,
+  "wait_for": null,
   "html": true,
   "screenshot": false,
   "proxy": "http://user:pass@host:port"
@@ -67,7 +70,10 @@ Authorization: Bearer <API_TOKEN>
 | Поле | Тип | По умолчанию | Описание |
 |---|---|---|---|
 | `url` | string | — | адрес страницы (обязательно) |
-| `wait_ms` | int | `2000` | пауза после загрузки, мс |
+| `wait_mode` | `"smart"` \| `"fixed"` | `"smart"` | `smart` — ждать снятия челленджа Cloudflare/Turnstile; `fixed` — просто выждать `wait_ms` |
+| `wait_ms` | int | `2000` | пауза после готовности (в режиме `fixed` — единственная пауза) |
+| `ready_timeout_ms` | int | `60000` | максимум ожидания челленджа и таймаут загрузки страницы |
+| `wait_for` | string \| null | `null` | CSS-селектор, появление которого считаем готовностью (только в `smart`) |
 | `html` | bool | `true` | вернуть `page.content()` |
 | `screenshot` | bool | `false` | вернуть PNG в base64 |
 | `proxy` | string | `null` | HTTP/SOCKS-прокси |
@@ -79,8 +85,41 @@ Authorization: Bearer <API_TOKEN>
   "ok": true,
   "final_url": "https://example.com/",
   "title": "Example Domain",
+  "challenge_cleared": true,
+  "detected_by": null,
+  "waited_ms": 4200,
   "html": "<!DOCTYPE html>...",
   "screenshot_b64": "iVBORw0KGgo..."
+}
+```
+
+`challenge_cleared: false` означает, что проверка браузера не снялась за `ready_timeout_ms`. Поле `detected_by` показывает, **чем** она была распознана: `stage`, `body_text`, `error_text`, `cf_running`, `cf_script`, `turnstile`, `title` или `error`. Если `challenge_cleared: false` — это сигнал для ветвления в n8n: повторить позже, сменить прокси или упасть в ошибку. `waited_ms` показывает, сколько реально заняло ожидание.
+
+### Ожидание готовности страницы
+
+Cloudflare и Turnstile показывают заглушку и снимают её не мгновенно — обычно 5–15 секунд, иногда дольше. Поэтому по умолчанию включён режим `smart`: сервис опрашивает страницу каждые 500 мс и возвращает ответ, **как только челлендж исчез**, не дожидаясь полного таймаута.
+
+Проверка идёт **по структуре DOM**, а не по тексту — это важно при работе через прокси с разными гео, где Cloudflare локализует страницу под язык региона. Маркеры:
+
+| `detected_by` | Что найдено |
+|---|---|
+| `stage` | `#challenge-stage` |
+| `body_text` | `#challenge-body-text` |
+| `error_text` | `#challenge-error-text` |
+| `cf_running` | `#cf-challenge-running` |
+| `cf_script` | `script[src*="challenge-platform"]` |
+| `turnstile` | `iframe[src*="challenges.cloudflare.com"]` |
+| `title` | английские заголовки вида `Just a moment...` (запасной признак) |
+
+Если нужен строго предсказуемый сценарий — `"wait_mode": "fixed"`: сервис не смотрит на челлендж и просто выжидает `wait_ms` миллисекунд.
+
+Дополнительно `wait_for` позволяет дождаться конкретного элемента:
+
+```json
+{
+  "url": "https://example.com/news",
+  "wait_for": "article h1",
+  "ready_timeout_ms": 30000
 }
 ```
 

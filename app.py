@@ -13,6 +13,8 @@ Auth: if API_TOKEN env var is set, requests must send
 import base64
 import os
 import re
+import time
+from typing import Literal
 from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Response
@@ -28,12 +30,35 @@ HEADLESS = True if _raw_headless == "true" else False if _raw_headless == "false
 # предохранитель: не тянуть в память файл больше лимита
 MAX_BYTES = int(os.environ.get("MAX_DOWNLOAD_MB", "200")) * 1024 * 1024
 
+# --- распознавание проверки браузера -----------------------------------------
+# Основной признак — структура DOM: она одинакова для всех языков.
+# Заголовок локализуется под гео IP прокси, поэтому он только запасной вариант.
+CHALLENGE_SELECTORS: tuple[tuple[str, str], ...] = (
+    ("stage", "#challenge-stage"),
+    ("body_text", "#challenge-body-text"),
+    ("error_text", "#challenge-error-text"),
+    ("cf_running", "#cf-challenge-running"),
+    ("cf_script", 'script[src*="challenge-platform"]'),
+    ("turnstile", 'iframe[src*="challenges.cloudflare.com"]'),
+)
+
+CHALLENGE_TITLE_RE = re.compile(
+    r"just a moment|checking your browser|attention required|verify you are human"
+    r"|ddos-guard|access denied|security check",
+    re.IGNORECASE,
+)
+
 app = FastAPI(title="camoufox-service")
 
 
 class Job(BaseModel):
     url: str
+    # smart: ждать, пока снимется челлендж Cloudflare/Turnstile (до ready_timeout_ms)
+    # fixed: не проверять челлендж, просто выждать wait_ms
+    wait_mode: Literal["smart", "fixed"] = "smart"
     wait_ms: int = 2000
+    ready_timeout_ms: int = 60000
+    wait_for: str | None = None
     screenshot: bool = False
     html: bool = True
     proxy: str | None = None
@@ -65,6 +90,35 @@ def launch_kwargs(proxy: str | None) -> dict:
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     return kwargs
+
+
+def challenge_marker(page) -> str | None:
+    """Возвращает маркер незавершённой проверки браузера, либо None если страница готова."""
+    for name, selector in CHALLENGE_SELECTORS:
+        try:
+            if page.query_selector(selector) is not None:
+                return name
+        except Exception:
+            return "error"  # страница в момент навигации — считаем, что ещё не готово
+
+    try:
+        title = page.title() or ""
+    except Exception:
+        return "error"
+
+    if CHALLENGE_TITLE_RE.search(title):
+        return "title"
+    return None
+
+
+def wait_until_ready(page, timeout_ms: int) -> tuple[bool, int]:
+    """Ждёт снятия проверки. Возвращает (снялась_ли, сколько_ждали_мс)."""
+    started = time.monotonic()
+    marker = challenge_marker(page)
+    while marker is not None and (time.monotonic() - started) * 1000 < timeout_ms:
+        page.wait_for_timeout(500)
+        marker = challenge_marker(page)
+    return marker is None, int((time.monotonic() - started) * 1000)
 
 
 def filename_from(headers: dict, url: str) -> str:
@@ -102,10 +156,29 @@ def scrape(job: Job, authorization: str | None = Header(default=None)) -> dict:
 
     with Camoufox(**launch_kwargs(job.proxy)) as browser:
         page = browser.new_page()
-        page.goto(job.url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(job.wait_ms)
+        page.goto(job.url, wait_until="domcontentloaded", timeout=job.ready_timeout_ms)
 
-        result: dict = {"ok": True, "final_url": page.url, "title": page.title()}
+        waited_ms = 0
+        if job.wait_mode == "smart":
+            _, waited_ms = wait_until_ready(page, job.ready_timeout_ms)
+            if job.wait_for:
+                try:
+                    page.wait_for_selector(job.wait_for, timeout=job.ready_timeout_ms)
+                except Exception:
+                    pass  # селектор не появился — вернём что есть
+
+        if job.wait_ms:
+            page.wait_for_timeout(job.wait_ms)
+
+        marker = challenge_marker(page)
+        result: dict = {
+            "ok": True,
+            "final_url": page.url,
+            "title": page.title(),
+            "challenge_cleared": marker is None,
+            "detected_by": marker,
+            "waited_ms": waited_ms,
+        }
         if job.html:
             result["html"] = page.content()
         if job.screenshot:
