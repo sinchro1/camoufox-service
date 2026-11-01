@@ -1,0 +1,3 @@
+camoufox[geoip]
+fastapi
+uvicorn[standard]
