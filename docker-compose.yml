@@ -4,8 +4,8 @@ services:
     image: ghcr.io/sinchro1/camoufox-service:latest
     container_name: camoufox-service
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+#    ports:
+#      - "8000:8000"
     environment:
       - API_TOKEN=${API_TOKEN}
       - CAMOUFOX_VIRTUAL_DISPLAY_SIZE=1920x1080x24
