@@ -1,7 +1,7 @@
 services:
   camoufox:
     # замените your-github-login на свой логин в нижнем регистре
-    image: ghcr.io/your-github-login/camoufox-service:latest
+    image: ghcr.io/sinchro1/camoufox-service:latest
     container_name: camoufox-service
     restart: unless-stopped
     ports:
