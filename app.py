@@ -245,7 +245,20 @@ def scrape(job: Job, authorization: str | None = Header(default=None)):
             try:
                 navigation = page.goto(job.url, wait_until="domcontentloaded", timeout=goto_timeout)
             except Exception as exc:
-                is_timeout = "timeout" in str(exc).lower()
+                text = str(exc).lower()
+                # отказ именно прокси, а не сайта: такую попытку надо учитывать
+                # как fail_conn, иначе пул деградирует незаметно
+                proxy_markers = (
+                    "proxy_connection_refused",
+                    "err_proxy",
+                    "proxy connect",
+                    "proxy server",
+                    "err_tunnel_connection_failed",
+                    "proxy authentication",
+                )
+                if proxy and any(marker in text for marker in proxy_markers):
+                    return error_response(502, "proxy_unreachable", str(exc), proxy)
+                is_timeout = "timeout" in text
                 return error_response(
                     504 if is_timeout else 502,
                     "timeout" if is_timeout else "navigation_failed",
