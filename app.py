@@ -42,12 +42,14 @@ MAX_CONCURRENCY = 50
 # Основной признак — структура DOM: она одинакова для всех языков.
 # Заголовок локализуется под гео IP прокси, поэтому он только запасной вариант.
 CHALLENGE_SELECTORS: tuple[tuple[str, str], ...] = (
+    # turnstile первым: наличие виджета означает, что нужен клик/взаимодействие,
+    # и это важнее для диагностики, чем сам факт cf-скрипта на странице
+    ("turnstile", 'iframe[src*="challenges.cloudflare.com"]'),
     ("stage", "#challenge-stage"),
     ("body_text", "#challenge-body-text"),
     ("error_text", "#challenge-error-text"),
     ("cf_running", "#cf-challenge-running"),
     ("cf_script", 'script[src*="challenge-platform"]'),
-    ("turnstile", 'iframe[src*="challenges.cloudflare.com"]'),
 )
 
 CHALLENGE_TITLE_RE = re.compile(
@@ -71,6 +73,8 @@ class Job(BaseModel):
     screenshot: bool = False
     html: bool = True
     proxy: str | None = None
+    disable_coop: bool = False
+    humanize: bool = False
 
 
 class ProxyCheckJob(BaseModel):
@@ -111,10 +115,19 @@ def normalize_proxy(value: str | None) -> str | None:
     return value if "://" in value else f"http://{value}"
 
 
-def launch_kwargs(proxy: str | None) -> dict:
+def launch_kwargs(
+    proxy: str | None,
+    disable_coop: bool = False,
+    humanize: bool = False,
+) -> dict:
     kwargs: dict = {"headless": HEADLESS, "geoip": True}
     if proxy:
         kwargs["proxy"] = {"server": proxy}
+    if disable_coop:
+        # нужно, чтобы можно было кликнуть по Turnstile в cross-origin iframe
+        kwargs["disable_coop"] = True
+    if humanize:
+        kwargs["humanize"] = True
     return kwargs
 
 
@@ -226,7 +239,7 @@ def scrape(job: Job, authorization: str | None = Header(default=None)):
     goto_timeout = job.goto_timeout_ms or job.ready_timeout_ms
 
     try:
-        with Camoufox(**launch_kwargs(proxy)) as browser:
+        with Camoufox(**launch_kwargs(proxy, job.disable_coop, job.humanize)) as browser:
             page = browser.new_page()
 
             try:
