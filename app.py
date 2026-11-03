@@ -3,6 +3,7 @@
 Endpoints:
     GET  /health          -> {"ok": true}
     POST /scrape          -> {"ok": true, "final_url", "title", "html", "screenshot_b64"}
+    POST /proxy-check     -> batch reachability check for plain HTTP proxies
     POST /download        -> binary file fetched by URL through the browser context
     POST /download-click  -> binary file captured after clicking an element
 
@@ -14,10 +15,13 @@ import base64
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from fastapi import FastAPI, Header, HTTPException, Response
+import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from camoufox.sync_api import Camoufox, NewContext
@@ -29,6 +33,10 @@ HEADLESS = True if _raw_headless == "true" else False if _raw_headless == "false
 
 # предохранитель: не тянуть в память файл больше лимита
 MAX_BYTES = int(os.environ.get("MAX_DOWNLOAD_MB", "200")) * 1024 * 1024
+
+# ограничения массовой проверки прокси
+MAX_PROXIES_PER_CHECK = 500
+MAX_CONCURRENCY = 50
 
 # --- распознавание проверки браузера -----------------------------------------
 # Основной признак — структура DOM: она одинакова для всех языков.
@@ -58,10 +66,18 @@ class Job(BaseModel):
     wait_mode: Literal["smart", "fixed"] = "smart"
     wait_ms: int = 2000
     ready_timeout_ms: int = 60000
+    goto_timeout_ms: int | None = None  # по умолчанию = ready_timeout_ms
     wait_for: str | None = None
     screenshot: bool = False
     html: bool = True
     proxy: str | None = None
+
+
+class ProxyCheckJob(BaseModel):
+    proxies: list[str]
+    timeout_ms: int = 8000
+    concurrency: int = 20
+    test_url: str = "http://api.ipify.org"
 
 
 class DownloadJob(BaseModel):
@@ -85,11 +101,33 @@ def check_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="bad token")
 
 
+def normalize_proxy(value: str | None) -> str | None:
+    """'1.2.3.4:8080' -> 'http://1.2.3.4:8080'. Схема сохраняется, если указана."""
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    return value if "://" in value else f"http://{value}"
+
+
 def launch_kwargs(proxy: str | None) -> dict:
     kwargs: dict = {"headless": HEADLESS, "geoip": True}
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     return kwargs
+
+
+def error_response(status_code: int, code: str, detail: str, proxy: str | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ok": False,
+            "error": code,
+            "detail": detail[:1000],
+            "proxy": proxy,
+        },
+    )
 
 
 def challenge_marker(page) -> str | None:
@@ -145,47 +183,122 @@ def file_response(data: bytes, filename: str, content_type: str, as_b64: bool):
     )
 
 
+def check_single_proxy(raw: str, test_url: str, timeout_s: float) -> dict:
+    """Проверка прокси обычным HTTP-запросом, без запуска браузера."""
+    proxy = normalize_proxy(raw)
+    result: dict = {"proxy": proxy, "ok": False, "ms": None, "exit_ip": None, "error": None}
+    if not proxy:
+        result["error"] = "empty proxy"
+        return result
+
+    started = time.monotonic()
+    try:
+        response = requests.get(
+            test_url,
+            proxies={"http": proxy, "https": proxy},
+            timeout=timeout_s,
+            headers={"User-Agent": "camoufox-service/proxy-check"},
+        )
+        result["ms"] = int((time.monotonic() - started) * 1000)
+        if response.status_code != 200:
+            result["error"] = f"http {response.status_code}"
+            return result
+        body = (response.text or "").strip()
+        result["exit_ip"] = body[:64] if body else None
+        result["ok"] = True
+        return result
+    except Exception as exc:
+        result["ms"] = int((time.monotonic() - started) * 1000)
+        result["error"] = (str(exc) or type(exc).__name__)[:200]
+        return result
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
 
 
 @app.post("/scrape")
-def scrape(job: Job, authorization: str | None = Header(default=None)) -> dict:
+def scrape(job: Job, authorization: str | None = Header(default=None)):
     check_auth(authorization)
 
-    with Camoufox(**launch_kwargs(job.proxy)) as browser:
-        page = browser.new_page()
-        page.goto(job.url, wait_until="domcontentloaded", timeout=job.ready_timeout_ms)
+    proxy = normalize_proxy(job.proxy)
+    goto_timeout = job.goto_timeout_ms or job.ready_timeout_ms
 
-        waited_ms = 0
-        if job.wait_mode == "smart":
-            _, waited_ms = wait_until_ready(page, job.ready_timeout_ms)
-            if job.wait_for:
-                try:
-                    page.wait_for_selector(job.wait_for, timeout=job.ready_timeout_ms)
-                except Exception:
-                    pass  # селектор не появился — вернём что есть
+    try:
+        with Camoufox(**launch_kwargs(proxy)) as browser:
+            page = browser.new_page()
 
-        if job.wait_ms:
-            page.wait_for_timeout(job.wait_ms)
+            try:
+                navigation = page.goto(job.url, wait_until="domcontentloaded", timeout=goto_timeout)
+            except Exception as exc:
+                is_timeout = "timeout" in str(exc).lower()
+                return error_response(
+                    504 if is_timeout else 502,
+                    "timeout" if is_timeout else "navigation_failed",
+                    str(exc),
+                    proxy,
+                )
 
-        marker = challenge_marker(page)
-        result: dict = {
-            "ok": True,
-            "final_url": page.url,
-            "title": page.title(),
-            "challenge_cleared": marker is None,
-            "detected_by": marker,
-            "waited_ms": waited_ms,
-        }
-        if job.html:
-            result["html"] = page.content()
-        if job.screenshot:
-            result["screenshot_b64"] = base64.b64encode(
-                page.screenshot(full_page=False)
-            ).decode()
-        return result
+            waited_ms = 0
+            if job.wait_mode == "smart":
+                _, waited_ms = wait_until_ready(page, job.ready_timeout_ms)
+                if job.wait_for:
+                    try:
+                        page.wait_for_selector(job.wait_for, timeout=job.ready_timeout_ms)
+                    except Exception:
+                        pass  # селектор не появился — вернём что есть
+
+            if job.wait_ms:
+                page.wait_for_timeout(job.wait_ms)
+
+            marker = challenge_marker(page)
+            result: dict = {
+                "ok": True,
+                "final_url": page.url,
+                "title": page.title(),
+                "http_status": getattr(navigation, "status", None),
+                "challenge_cleared": marker is None,
+                "detected_by": marker,
+                "waited_ms": waited_ms,
+                "proxy": proxy,
+            }
+            if job.html:
+                result["html"] = page.content()
+            if job.screenshot:
+                result["screenshot_b64"] = base64.b64encode(
+                    page.screenshot(full_page=False)
+                ).decode()
+            return result
+    except Exception as exc:
+        # сюда попадают ошибки запуска браузера и работы через прокси
+        return error_response(
+            502,
+            "proxy_unreachable" if proxy else "launch_failed",
+            str(exc),
+            proxy,
+        )
+
+
+@app.post("/proxy-check")
+def proxy_check(job: ProxyCheckJob, authorization: str | None = Header(default=None)) -> dict:
+    check_auth(authorization)
+
+    items = job.proxies[:MAX_PROXIES_PER_CHECK]
+    workers = max(1, min(job.concurrency, MAX_CONCURRENCY, len(items) or 1))
+    timeout_s = max(1, job.timeout_ms) / 1000
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(
+            pool.map(lambda raw: check_single_proxy(raw, job.test_url, timeout_s), items)
+        )
+
+    return {
+        "ok": True,
+        "checked": len(results),
+        "alive": sum(1 for item in results if item["ok"]),
+        "results": results,
+    }
 
 
 @app.post("/download")
@@ -193,27 +306,38 @@ def download(job: DownloadJob, authorization: str | None = Header(default=None))
     """Забрать файл по прямой ссылке: куки контекста и прокси сохраняются."""
     check_auth(authorization)
 
-    with Camoufox(**launch_kwargs(job.proxy)) as browser:
-        context = NewContext(browser)
-        response = context.request.get(job.url, timeout=job.timeout_ms)
+    proxy = normalize_proxy(job.proxy)
+    try:
+        with Camoufox(**launch_kwargs(proxy)) as browser:
+            context = NewContext(browser)
+            response = context.request.get(job.url, timeout=job.timeout_ms)
 
-        if not response.ok:
-            raise HTTPException(status_code=502, detail=f"upstream HTTP {response.status}")
+            if not response.ok:
+                raise HTTPException(status_code=502, detail=f"upstream HTTP {response.status}")
 
-        declared = response.headers.get("content-length")
-        if declared and int(declared) > MAX_BYTES:
-            raise HTTPException(status_code=413, detail=f"file too large: {declared} bytes")
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > MAX_BYTES:
+                raise HTTPException(status_code=413, detail=f"file too large: {declared} bytes")
 
-        data = response.body()
-        if len(data) > MAX_BYTES:
-            raise HTTPException(status_code=413, detail=f"file too large: {len(data)} bytes")
+            data = response.body()
+            if len(data) > MAX_BYTES:
+                raise HTTPException(status_code=413, detail=f"file too large: {len(data)} bytes")
 
-        content_type = (response.headers.get("content-type") or "application/octet-stream").split(";")[0]
-        return file_response(
-            data,
-            filename_from(response.headers, job.url),
-            content_type,
-            job.b64,
+            content_type = (response.headers.get("content-type") or "application/octet-stream").split(";")[0]
+            return file_response(
+                data,
+                filename_from(response.headers, job.url),
+                content_type,
+                job.b64,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return error_response(
+            502,
+            "proxy_unreachable" if proxy else "launch_failed",
+            str(exc),
+            proxy,
         )
 
 
@@ -222,32 +346,43 @@ def download_click(job: ClickJob, authorization: str | None = Header(default=Non
     """Открыть страницу, нажать элемент и перехватить скачивание."""
     check_auth(authorization)
 
-    with Camoufox(**launch_kwargs(job.proxy)) as browser:
-        context = NewContext(browser, accept_downloads=True)
-        page = context.new_page()
-        page.goto(job.url, wait_until="domcontentloaded", timeout=job.timeout_ms)
-        page.wait_for_timeout(job.wait_ms)
+    proxy = normalize_proxy(job.proxy)
+    try:
+        with Camoufox(**launch_kwargs(proxy)) as browser:
+            context = NewContext(browser, accept_downloads=True)
+            page = context.new_page()
+            page.goto(job.url, wait_until="domcontentloaded", timeout=job.timeout_ms)
+            page.wait_for_timeout(job.wait_ms)
 
-        try:
-            with page.expect_download(timeout=job.timeout_ms) as incoming:
-                page.click(job.selector, timeout=job.timeout_ms)
-            download_event = incoming.value
-        except Exception as exc:  # таймаут, неверный селектор, файл не начал качаться
-            raise HTTPException(status_code=504, detail=f"download not triggered: {exc}") from exc
+            try:
+                with page.expect_download(timeout=job.timeout_ms) as incoming:
+                    page.click(job.selector, timeout=job.timeout_ms)
+                download_event = incoming.value
+            except Exception as exc:  # таймаут, неверный селектор, файл не начал качаться
+                raise HTTPException(status_code=504, detail=f"download not triggered: {exc}") from exc
 
-        local_path = download_event.path()
-        if local_path is None:
-            raise HTTPException(status_code=502, detail="download produced no file")
+            local_path = download_event.path()
+            if local_path is None:
+                raise HTTPException(status_code=502, detail="download produced no file")
 
-        with open(local_path, "rb") as handle:
-            data = handle.read()
+            with open(local_path, "rb") as handle:
+                data = handle.read()
 
-        if len(data) > MAX_BYTES:
-            raise HTTPException(status_code=413, detail=f"file too large: {len(data)} bytes")
+            if len(data) > MAX_BYTES:
+                raise HTTPException(status_code=413, detail=f"file too large: {len(data)} bytes")
 
-        return file_response(
-            data,
-            download_event.suggested_filename or "download.bin",
-            "application/octet-stream",
-            job.b64,
+            return file_response(
+                data,
+                download_event.suggested_filename or "download.bin",
+                "application/octet-stream",
+                job.b64,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return error_response(
+            502,
+            "proxy_unreachable" if proxy else "launch_failed",
+            str(exc),
+            proxy,
         )
