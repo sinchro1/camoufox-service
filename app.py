@@ -12,6 +12,7 @@ Auth: if API_TOKEN env var is set, requests must send
 """
 
 import base64
+import json
 import os
 import re
 import time
@@ -82,6 +83,7 @@ class ProxyCheckJob(BaseModel):
     timeout_ms: int = 8000
     concurrency: int = 20
     test_url: str = "http://api.ipify.org"
+    fallback_url: str = "http://icanhazip.com"
 
 
 class DownloadJob(BaseModel):
@@ -196,34 +198,115 @@ def file_response(data: bytes, filename: str, content_type: str, as_b64: bool):
     )
 
 
-def check_single_proxy(raw: str, test_url: str, timeout_s: float) -> dict:
-    """Проверка прокси обычным HTTP-запросом, без запуска браузера."""
+def extract_exit_ip(body: str) -> str | None:
+    text = (body or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("ip", "origin", "query", "address"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    return value.split(",")[0].strip()[:64]
+    except Exception:
+        pass
+    match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+    if match:
+        return match.group(0)
+    match = re.search(r"\b[0-9a-f:]{6,45}\b", text, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def classify_proxy_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "connecttimeout" in name or "connect timeout" in text:
+        return "connect_timeout"
+    if "readtimeout" in name or "read timed out" in text:
+        return "read_timeout"
+    if "refused" in text:
+        return "refused"
+    if "reset" in text:
+        return "reset"
+    if "resolve" in text or "name or service not known" in text or "nodename nor servname" in text:
+        return "dns"
+    if "ssl" in text or "certificate" in text:
+        return "tls"
+    if "timeout" in text:
+        return "timeout"
+    return "other"
+
+
+def check_single_proxy(
+    raw: str,
+    test_url: str,
+    timeout_s: float,
+    fallback_url: str | None = None,
+) -> dict:
+    """Проверка прокси обычным HTTP-запросом, без запуска браузера.
+
+    ok        — подтверждён выходной IP, прокси реально проксирует
+    reachable — прокси ответил любым HTTP-статусом (жив на транспортном уровне)
+    """
     proxy = normalize_proxy(raw)
-    result: dict = {"proxy": proxy, "ok": False, "ms": None, "exit_ip": None, "error": None}
+    result: dict = {
+        "proxy": proxy,
+        "ok": False,
+        "reachable": False,
+        "http_status": None,
+        "ms": None,
+        "exit_ip": None,
+        "error_code": None,
+        "error": None,
+    }
     if not proxy:
         result["error"] = "empty proxy"
+        result["error_code"] = "other"
         return result
 
+    urls = [test_url]
+    if fallback_url and fallback_url != test_url:
+        urls.append(fallback_url)
+
     started = time.monotonic()
-    try:
-        response = requests.get(
-            test_url,
-            proxies={"http": proxy, "https": proxy},
-            timeout=timeout_s,
-            headers={"User-Agent": "camoufox-service/proxy-check"},
-        )
-        result["ms"] = int((time.monotonic() - started) * 1000)
-        if response.status_code != 200:
-            result["error"] = f"http {response.status_code}"
+    for url in urls:
+        try:
+            response = requests.get(
+                url,
+                proxies={"http": proxy, "https": proxy},
+                timeout=timeout_s,
+                headers={"User-Agent": "camoufox-service/proxy-check"},
+            )
+        except Exception as exc:
+            result["ms"] = int((time.monotonic() - started) * 1000)
+            result["error"] = (str(exc) or type(exc).__name__)[:200]
+            result["error_code"] = classify_proxy_error(exc)
             return result
-        body = (response.text or "").strip()
-        result["exit_ip"] = body[:64] if body else None
-        result["ok"] = True
-        return result
-    except Exception as exc:
+
         result["ms"] = int((time.monotonic() - started) * 1000)
-        result["error"] = (str(exc) or type(exc).__name__)[:200]
+        result["http_status"] = response.status_code
+        result["reachable"] = True
+
+        if response.status_code == 200:
+            ip = extract_exit_ip(response.text)
+            if ip:
+                result.update(exit_ip=ip, ok=True, error=None, error_code=None)
+                return result
+            result["error"] = "no ip in response"
+            result["error_code"] = "other"
+            return result
+
+        # 403/429/503 — это лимит тестового сервиса, а не отказ прокси.
+        # Пробуем запасной адрес, прежде чем считать прокси плохим.
+        if response.status_code in (403, 429, 503) and url != urls[-1]:
+            continue
+
+        result["error"] = f"http {response.status_code}"
+        result["error_code"] = "blocked" if response.status_code in (403, 407) else "http_error"
         return result
+
+    return result
 
 
 @app.get("/health")
@@ -316,13 +399,17 @@ def proxy_check(job: ProxyCheckJob, authorization: str | None = Header(default=N
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(
-            pool.map(lambda raw: check_single_proxy(raw, job.test_url, timeout_s), items)
+            pool.map(
+                lambda raw: check_single_proxy(raw, job.test_url, timeout_s, job.fallback_url),
+                items,
+            )
         )
 
     return {
         "ok": True,
         "checked": len(results),
         "alive": sum(1 for item in results if item["ok"]),
+        "reachable": sum(1 for item in results if item["reachable"]),
         "results": results,
     }
 
