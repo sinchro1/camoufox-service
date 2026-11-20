@@ -1,3 +1,3 @@
-camoufox[geoip]
-fastapi
-uvicorn[standard]
+camoufox[geoip]==0.5.9
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
