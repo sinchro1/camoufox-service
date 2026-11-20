@@ -35,6 +35,11 @@ HEADLESS = True if _raw_headless == "true" else False if _raw_headless == "false
 # предохранитель: не тянуть в память файл больше лимита
 MAX_BYTES = int(os.environ.get("MAX_DOWNLOAD_MB", "200")) * 1024 * 1024
 
+# ограничения на пользовательские куки
+MAX_COOKIE_BYTES = 16 * 1024
+COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\.~]{1,128}$")
+SAME_SITE = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+
 # ограничения массовой проверки прокси
 MAX_PROXIES_PER_CHECK = 500
 MAX_CONCURRENCY = 50
@@ -76,6 +81,11 @@ class Job(BaseModel):
     proxy: str | None = None
     disable_coop: bool = False
     humanize: bool = False
+    # куки авторизации: cookie_header — строка "a=1; b=2" из DevTools,
+    # cookies — список в формате Playwright. Оба необязательны.
+    cookies: list[dict] | None = None
+    cookie_header: str | None = None
+    return_cookies: bool = False
 
 
 class ProxyCheckJob(BaseModel):
@@ -91,6 +101,9 @@ class DownloadJob(BaseModel):
     timeout_ms: int = 60000
     proxy: str | None = None
     b64: bool = False
+    cookies: list[dict] | None = None
+    cookie_header: str | None = None
+    return_cookies: bool = False  # работает только вместе с b64
 
 
 class ClickJob(BaseModel):
@@ -100,6 +113,9 @@ class ClickJob(BaseModel):
     timeout_ms: int = 60000
     proxy: str | None = None
     b64: bool = False
+    cookies: list[dict] | None = None
+    cookie_header: str | None = None
+    return_cookies: bool = False  # работает только вместе с b64
 
 
 def check_auth(authorization: str | None) -> None:
@@ -115,6 +131,88 @@ def normalize_proxy(value: str | None) -> str | None:
     if not value:
         return None
     return value if "://" in value else f"http://{value}"
+
+
+def build_cookies(
+    cookies: list[dict] | None,
+    cookie_header: str | None,
+    page_url: str,
+) -> list[dict]:
+    """Переданные куки -> формат Playwright. Пустой список, если ничего не задано."""
+    parsed = urlparse(page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+    out: list[dict] = []
+
+    # "a=1; b=2" из DevTools -> куки, привязанные к домену целевой страницы
+    if cookie_header:
+        for chunk in cookie_header.split(";"):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk or origin is None:
+                continue
+            name, _, value = chunk.partition("=")
+            name = name.strip()
+            if COOKIE_NAME_RE.match(name):
+                out.append({"name": name, "value": value.strip(), "url": origin})
+
+    for raw in cookies or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not COOKIE_NAME_RE.match(name):
+            continue
+        item: dict = {"name": name, "value": str(raw.get("value") or "")}
+        # Playwright требует либо url, либо domain+path
+        if raw.get("url"):
+            item["url"] = str(raw["url"])
+        elif raw.get("domain"):
+            item["domain"] = str(raw["domain"])
+            item["path"] = str(raw.get("path") or "/")
+        elif origin:
+            item["url"] = origin
+        else:
+            continue
+        if isinstance(raw.get("expires"), (int, float)) and not isinstance(raw.get("expires"), bool):
+            item["expires"] = float(raw["expires"])
+        for flag in ("httpOnly", "secure"):
+            if isinstance(raw.get(flag), bool):
+                item[flag] = raw[flag]
+        same = raw.get("sameSite")
+        if isinstance(same, str) and same.strip().lower() in SAME_SITE:
+            item["sameSite"] = SAME_SITE[same.strip().lower()]
+        out.append(item)
+
+    total = sum(len(c["name"]) + len(c["value"]) for c in out)
+    if total > MAX_COOKIE_BYTES:
+        raise HTTPException(status_code=413, detail=f"cookies too large: {total} bytes")
+    return out
+
+
+def cookies_snapshot(context) -> list[dict]:
+    """Актуальные куки контекста для ответа клиенту."""
+    try:
+        items = context.cookies()
+    except Exception:
+        return []
+    out: list[dict] = []
+    total = 0
+    for c in items:
+        value = str(c.get("value") or "")
+        total += len(value)
+        if total > MAX_COOKIE_BYTES:
+            break
+        out.append(
+            {
+                "name": c.get("name"),
+                "value": value,
+                "domain": c.get("domain"),
+                "path": c.get("path"),
+                "expires": c.get("expires"),
+                "httpOnly": c.get("httpOnly"),
+                "secure": c.get("secure"),
+                "sameSite": c.get("sameSite"),
+            }
+        )
+    return out
 
 
 def launch_kwargs(
@@ -183,14 +281,19 @@ def filename_from(headers: dict, url: str) -> str:
     return unquote(name) or "download.bin"
 
 
-def file_response(data: bytes, filename: str, content_type: str, as_b64: bool):
+def file_response(data: bytes, filename: str, content_type: str, as_b64: bool, cookies: list[dict] | None = None):
     if as_b64:
-        return {
+        payload: dict = {
             "filename": filename,
             "content_type": content_type,
             "size": len(data),
             "b64": base64.b64encode(data).decode(),
         }
+        # куки отдаём только в b64-режиме — в бинаре их некуда положить
+        if cookies is not None:
+            payload["cookies"] = cookies
+        return payload
+    # бинарный ответ: куки сюда не добавляем, только filename в Content-Disposition
     return Response(
         content=data,
         media_type=content_type,
@@ -320,10 +423,14 @@ def scrape(job: Job, authorization: str | None = Header(default=None)):
 
     proxy = normalize_proxy(job.proxy)
     goto_timeout = job.goto_timeout_ms or job.ready_timeout_ms
+    # валидация кук до try: 413 не должен превращаться в общий 502
+    cookies = build_cookies(job.cookies, job.cookie_header, job.url)
 
     try:
         with Camoufox(**launch_kwargs(proxy, job.disable_coop, job.humanize)) as browser:
             page = browser.new_page()
+            if cookies:
+                page.context.add_cookies(cookies)
 
             try:
                 navigation = page.goto(job.url, wait_until="domcontentloaded", timeout=goto_timeout)
@@ -378,6 +485,8 @@ def scrape(job: Job, authorization: str | None = Header(default=None)):
                 result["screenshot_b64"] = base64.b64encode(
                     page.screenshot(full_page=False)
                 ).decode()
+            if job.return_cookies:
+                result["cookies"] = cookies_snapshot(page.context)
             return result
     except Exception as exc:
         # сюда попадают ошибки запуска браузера и работы через прокси
@@ -420,9 +529,12 @@ def download(job: DownloadJob, authorization: str | None = Header(default=None))
     check_auth(authorization)
 
     proxy = normalize_proxy(job.proxy)
+    cookies = build_cookies(job.cookies, job.cookie_header, job.url)
     try:
         with Camoufox(**launch_kwargs(proxy)) as browser:
             context = NewContext(browser)
+            if cookies:
+                context.add_cookies(cookies)
             response = context.request.get(job.url, timeout=job.timeout_ms)
 
             if not response.ok:
@@ -442,6 +554,7 @@ def download(job: DownloadJob, authorization: str | None = Header(default=None))
                 filename_from(response.headers, job.url),
                 content_type,
                 job.b64,
+                cookies_snapshot(context) if job.return_cookies else None,
             )
     except HTTPException:
         raise
@@ -460,9 +573,12 @@ def download_click(job: ClickJob, authorization: str | None = Header(default=Non
     check_auth(authorization)
 
     proxy = normalize_proxy(job.proxy)
+    cookies = build_cookies(job.cookies, job.cookie_header, job.url)
     try:
         with Camoufox(**launch_kwargs(proxy)) as browser:
             context = NewContext(browser, accept_downloads=True)
+            if cookies:
+                context.add_cookies(cookies)
             page = context.new_page()
             page.goto(job.url, wait_until="domcontentloaded", timeout=job.timeout_ms)
             page.wait_for_timeout(job.wait_ms)
@@ -489,6 +605,7 @@ def download_click(job: ClickJob, authorization: str | None = Header(default=Non
                 download_event.suggested_filename or "download.bin",
                 "application/octet-stream",
                 job.b64,
+                cookies_snapshot(context) if job.return_cookies else None,
             )
     except HTTPException:
         raise
