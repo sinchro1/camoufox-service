@@ -2,56 +2,47 @@
   "name": "camoufox-fetch",
   "nodes": [
     {
-      "parameters": {},
-      "type": "n8n-nodes-base.executeWorkflowTrigger",
-      "typeVersion": 1.2,
-      "position": [
-        -560,
-        0
-      ],
-      "id": "b1000000-0000-4000-8000-000000000001",
-      "name": "When Executed by Another Workflow"
-    },
-    {
       "parameters": {
-        "jsCode": "const incoming = $input.all();\nconst result = [];\n\n// накопитель попыток для текущего прогона (сбрасываем здесь же)\nconst sd = $getWorkflowStaticData('global');\nsd.attempts = [];\n\nfor (const element of incoming) {\n  let pageUrl = String(element.json.url ?? '').trim();\n  if (!pageUrl) {\n    throw new Error('url не передан на вход сабворкфлоу');\n  }\n\n  if (!/^[a-z][a-z0-9+.-]*:\\/\\//i.test(pageUrl)) {\n    pageUrl = 'https://' + pageUrl;\n  }\n\n  const parts = pageUrl.match(/^[a-z][a-z0-9+.-]*:\\/\\/([^\\/?#]+)/i);\n  const hostPort = parts ? parts[1] : '';\n  const bareHost = hostPort.split('@').pop().split(':')[0];\n  const domain = bareHost.toLowerCase().replace(/^www\\./, '');\n\n  if (!/^[a-z0-9.-]+$/.test(domain) || domain.indexOf('.') === -1) {\n    throw new Error('некорректный url: ' + pageUrl);\n  }\n\n  const attemptsLimit = Math.max(1, Math.min(Number(element.json.max_attempts ?? 4), 5));\n  result.push({ json: { url: pageUrl, domain: domain, max_attempts: attemptsLimit } });\n}\n\nreturn result;"
+        "jsCode": "const incoming = $input.all();\nconst result = [];\n\n// Отдельный накопитель для каждого execution: параллельные вызовы не перезаписывают друг друга.\nconst sd = $getWorkflowStaticData('global');\nif (!sd.attemptsByExecution || typeof sd.attemptsByExecution !== 'object') sd.attemptsByExecution = {};\nconst executionId = String($execution.id);\nsd.attemptsByExecution[executionId] = [];\n\nfor (const element of incoming) {\n  let pageUrl = String(element.json.url ?? '').trim();\n  if (!pageUrl) {\n    throw new Error('url не передан на вход сабворкфлоу');\n  }\n\n  if (!/^[a-z][a-z0-9+.-]*:\\/\\//i.test(pageUrl)) {\n    pageUrl = 'https://' + pageUrl;\n  }\n\n  const parts = pageUrl.match(/^[a-z][a-z0-9+.-]*:\\/\\/([^\\/?#]+)/i);\n  const hostPort = parts ? parts[1] : '';\n  const bareHost = hostPort.split('@').pop().split(':')[0];\n  const domain = bareHost.toLowerCase().replace(/^www\\./, '');\n\n  if (!/^[a-z0-9.-]+$/.test(domain) || domain.indexOf('.') === -1) {\n    throw new Error('некорректный url: ' + pageUrl);\n  }\n\n  const attemptsLimit = Math.max(1, Math.min(Number(element.json.max_attempts ?? 4), 5));\n  result.push({ json: { url: pageUrl, domain: domain, max_attempts: attemptsLimit } });\n}\n\nreturn result;"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -336,
-        0
+        2464,
+        2448
       ],
-      "id": "b1000000-0000-4000-8000-000000000002",
+      "id": "12c989fa-606f-474f-8de1-4a6a218fc300",
       "name": "Init"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "=SELECT p.id, p.ip, p.ms\nFROM site_proxy_stats s\nJOIN proxy_lst p ON p.id = s.proxy_id\nWHERE s.domain = '{{ $json.domain }}'\n  AND p.status = 1\n  AND p.ms IS NOT NULL\n  AND p.ms <= 4000\n  AND s.fail_count < 3\n  AND (s.cooldown_until IS NULL OR s.cooldown_until <= NOW())\nORDER BY s.ok_count DESC, COALESCE(s.last_used_at, '1970-01-01') ASC, p.ms ASC\nLIMIT 6"
+        "query": "SELECT p.id, p.ip, p.ms\nFROM site_proxy_stats s\nJOIN proxy_lst p ON p.id = s.proxy_id\nWHERE s.domain = '{{ $json.domain }}'\n  AND (p.status IN (0, 1) OR (p.status = 9 AND (p.checked_at IS NULL OR p.checked_at <= NOW() - INTERVAL 15 MINUTE)))\n  AND p.ms IS NOT NULL\n  AND p.ms <= 4000\n  AND s.fail_count < 3\n  AND NOT EXISTS (\n    SELECT 1 FROM proxy_log l\n    WHERE l.proxy_id = p.id\n      AND l.result = 'proxy_error'\n      AND l.created_at > NOW() - INTERVAL 1 HOUR\n  )\n  AND (s.cooldown_until IS NULL OR s.cooldown_until <= NOW())\nORDER BY s.ok_count DESC, COALESCE(s.last_used_at, '1970-01-01') ASC, p.ms ASC\nLIMIT 6",
+        "options": {}
       },
       "type": "n8n-nodes-base.mySql",
       "typeVersion": 2.5,
       "position": [
-        -112,
-        0
+        2688,
+        2448
       ],
-      "id": "b1000000-0000-4000-8000-000000000003",
+      "id": "f1db96b4-332f-4df9-92bc-b1f53f93aca5",
       "name": "SQL champions",
       "alwaysOutputData": true
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "=SELECT p.id, p.ip, p.ms\nFROM proxy_lst p\nLEFT JOIN site_proxy_stats s ON s.proxy_id = p.id AND s.domain = '{{ $('Init').item.json.domain }}'\nWHERE p.status = 1\n  AND p.ms IS NOT NULL\n  AND p.ms <= 4000\n  AND s.proxy_id IS NULL\nORDER BY RAND()\nLIMIT 8"
+        "query": "SELECT p.id, p.ip, p.ms\nFROM proxy_lst p\nLEFT JOIN site_proxy_stats s ON s.proxy_id = p.id AND s.domain = '{{ $('Init').item.json.domain }}'\nWHERE (p.status IN (0, 1) OR (p.status = 9 AND (p.checked_at IS NULL OR p.checked_at <= NOW() - INTERVAL 15 MINUTE)))\n  AND p.ms IS NOT NULL\n  AND p.ms <= 4000\n  AND s.proxy_id IS NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM proxy_log l\n    WHERE l.proxy_id = p.id\n      AND l.result = 'proxy_error'\n      AND l.created_at > NOW() - INTERVAL 1 HOUR\n  )\nORDER BY RAND()\nLIMIT 8",
+        "options": {}
       },
       "type": "n8n-nodes-base.mySql",
       "typeVersion": 2.5,
       "position": [
-        112,
-        0
+        2912,
+        2448
       ],
-      "id": "b1000000-0000-4000-8000-000000000004",
+      "id": "c9d13288-2580-4a85-a99f-d7843cf61b49",
       "name": "SQL newbies",
       "alwaysOutputData": true,
       "executeOnce": true
@@ -63,27 +54,23 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        336,
-        0
+        3136,
+        2448
       ],
-      "id": "b1000000-0000-4000-8000-000000000005",
+      "id": "ec9bac1e-2951-4fdb-ac77-1e0c94f349df",
       "name": "Combine"
     },
     {
       "parameters": {
         "method": "POST",
         "url": "http://camoufox-service:8000/proxy-check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
         "sendHeaders": true,
         "headerParameters": {
-          "parameters": [
-            {
-              "name": "Authorization",
-              "value": "=Bearer ВСТАВЬ_API_TOKEN"
-            }
-          ]
+          "parameters": []
         },
         "sendBody": true,
-        "contentType": "json",
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ proxies: $json.candidates.map(function (c) { return c.ip; }), timeout_ms: 12000, concurrency: 8 }) }}",
         "options": {
@@ -93,40 +80,36 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
       "position": [
-        560,
-        0
+        3360,
+        2448
       ],
-      "id": "b1000000-0000-4000-8000-000000000006",
+      "id": "bda0b37f-73dd-440e-a28a-6fe9e18538ee",
       "name": "Check proxies"
     },
     {
       "parameters": {
-        "jsCode": "const state = $('Combine').first().json;\nconst res = $input.first().json || {};\nconst results = Array.isArray(res.results) ? res.results : [];\nconst bare = (s) => String(s || '').replace(/^[a-z]+:\\/\\//i, '');\n\nconst byIp = new Map();\nfor (const c of state.candidates) {\n  byIp.set(bare(c.ip), c);\n}\n\nconst limit = Math.max(1, Math.min(state.max_attempts, 5));\n\n// порог мягкий: живые прокси из пула отвечают и по 7-8 секунд\nconst MS_LIMIT = 10000;\n\nconst alive = results\n  .filter((r) => {\n    if (!r) return false;\n    const fast = typeof r.ms === 'number' && r.ms <= MS_LIMIT;\n    if (r.ok === true) return true;\n    // прокси ответил HTTP-статусом (429/502/503) — он жив, просто тест не подтвердил IP\n    return r.reachable === true && fast;\n  })\n  .sort((a, b) => {\n    const verified = (b.ok ? 1 : 0) - (a.ok ? 1 : 0);\n    if (verified !== 0) return verified;\n    return (a.ms ?? 99999) - (b.ms ?? 99999);\n  })\n  .slice(0, limit - 1);\n\nconst out = [];\n\nfor (const r of alive) {\n  const c = byIp.get(bare(r.proxy));\n  out.push({\n    json: {\n      url: state.url,\n      domain: state.domain,\n      proxy_id: c ? c.id : null,\n      proxy: r.proxy,\n      ms: r.ms,\n      verified: r.ok === true,\n    },\n  });\n}\n\nout.push({\n  json: {\n    url: state.url,\n    domain: state.domain,\n    proxy_id: null,\n    proxy: null,\n    ms: 0,\n    verified: false,\n    checked: results.length,\n    alive_count: alive.length,\n  },\n});\n\nreturn out;"
+        "jsCode": "const state = $('Combine').first().json;\nconst res = $input.first().json || {};\nconst results = Array.isArray(res.results) ? res.results : [];\nconst bare = (s) => String(s || '').replace(/^[a-z]+:\\/\\//i, '');\n\nconst byIp = new Map();\nfor (const c of state.candidates) {\n  byIp.set(bare(c.ip), c);\n}\n\nconst limit = Math.max(1, Math.min(state.max_attempts, 5));\n\n// порог мягкий: живые прокси из пула отвечают и по 7-8 секунд\nconst MS_LIMIT = 10000;\n\n// Фиксированный прокси: пробуется после пула живых и перед запросом без прокси.\n// В max_attempts не входит. В proxy_lst его нет, поэтому статистика по нему не пишется.\nconst FIXED_PROXY = 'http://sinchrobelg.duckdns.org:42774';\n\nconst alive = results\n  .filter((r) => {\n    if (!r) return false;\n    const fast = typeof r.ms === 'number' && r.ms <= MS_LIMIT;\n    if (r.ok === true) return true;\n    // прокси ответил HTTP-статусом (429/502/503) — он жив, просто тест не подтвердил IP\n    return r.reachable === true && fast;\n  })\n  .sort((a, b) => {\n    const verified = (b.ok ? 1 : 0) - (a.ok ? 1 : 0);\n    if (verified !== 0) return verified;\n    return (a.ms ?? 99999) - (b.ms ?? 99999);\n  })\n  .slice(0, limit - 1);\n\nconst out = [];\n\nfor (const r of alive) {\n  const c = byIp.get(bare(r.proxy));\n  out.push({\n    json: {\n      url: state.url,\n      domain: state.domain,\n      proxy_id: c ? c.id : null,\n      proxy: r.proxy,\n      ms: r.ms,\n      verified: r.ok === true,\n    },\n  });\n}\n\nout.push({\n  json: {\n    url: state.url,\n    domain: state.domain,\n    proxy_id: null,\n    proxy: FIXED_PROXY,\n    ms: null,\n    verified: false,\n    fixed: true,\n  },\n});\n\nout.push({\n  json: {\n    url: state.url,\n    domain: state.domain,\n    proxy_id: null,\n    proxy: null,\n    ms: 0,\n    verified: false,\n    checked: results.length,\n    alive_count: alive.length,\n  },\n});\n\nreturn out;"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1008,
-        0
+        2320,
+        3120
       ],
-      "id": "b1000000-0000-4000-8000-000000000007",
+      "id": "ce9b0704-e08b-4a53-aff5-850f1b1688b0",
       "name": "Filter alive"
     },
     {
       "parameters": {
         "method": "POST",
         "url": "http://camoufox-service:8000/scrape",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
         "sendHeaders": true,
         "headerParameters": {
-          "parameters": [
-            {
-              "name": "Authorization",
-              "value": "=Bearer ВСТАВЬ_API_TOKEN"
-            }
-          ]
+          "parameters": []
         },
         "sendBody": true,
-        "contentType": "json",
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ url: $json.url, proxy: $json.proxy, wait_mode: 'smart', goto_timeout_ms: $json.proxy ? 30000 : 45000, ready_timeout_ms: $json.proxy ? 35000 : 120000, disable_coop: true, humanize: false, html: true, screenshot: false }) }}",
         "options": {
@@ -136,24 +119,24 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
       "position": [
-        1232,
-        -200
+        2432,
+        2800
       ],
-      "id": "b1000000-0000-4000-8000-000000000008",
+      "id": "3e982711-fbd7-434d-95ff-ccf655113d28",
       "name": "Scrape",
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
-        "jsCode": "const result = $input.first().json || {};\nconst current = $('Loop Over Items').item.json || {};\nconst via = current.proxy || 'direct';\n\nconst sd = $getWorkflowStaticData('global');\nif (!Array.isArray(sd.attempts)) sd.attempts = [];\n\nlet attempt;\nlet ok = false;\n\nif (result.ok === true && result.challenge_cleared === true) {\n  ok = true;\n  attempt = { proxy: via, result: 'ok', waited_ms: result.waited_ms, detected_by: result.detected_by };\n} else if (result.ok === true && result.challenge_cleared === false) {\n  attempt = { proxy: via, result: 'challenge', detected_by: result.detected_by, waited_ms: result.waited_ms };\n} else if (typeof result.error === 'string') {\n  attempt = { proxy: via, result: result.error, detail: String(result.detail || '').slice(0, 200) };\n} else if (result.error && typeof result.error === 'object') {\n  const msg = String(result.error.message || result.error.code || 'request failed').slice(0, 200);\n  attempt = { proxy: via, result: 'request_failed', detail: msg };\n} else {\n  attempt = { proxy: via, result: 'unknown_response' };\n}\n\nsd.attempts.push(attempt);\n\nreturn [{\n  json: {\n    final: ok,\n    proxy: via,\n    title: ok ? result.title : null,\n    http_status: ok ? result.http_status : null,\n    html: ok ? result.html : null,\n  },\n}];"
+        "jsCode": "const result = $input.first().json || {};\nconst current = $('Loop Over Items').item.json || {};\nconst state = $('Combine').first().json;\nconst via = current.proxy || 'direct';\n\nfunction mapOutcome(code, detail) {\n  if (code === 'proxy_unreachable' || code === 'launch_failed') return 'proxy_error';\n  // TLS-MITM: прокси подменяет сертификат — виноват прокси, а не сайт\n  if (code === 'navigation_failed' && /SEC_ERROR|ERR_CERT|PR_END_OF_FILE|PR_CONNECT_RESET/i.test(String(detail || ''))) return 'proxy_error';\n  if (code === 'timeout') return 'timeout';\n  return 'target_error';\n}\n\nconst sd = $getWorkflowStaticData('global');\nif (!sd.attemptsByExecution || typeof sd.attemptsByExecution !== 'object') sd.attemptsByExecution = {};\nconst executionId = String($execution.id);\nif (!Array.isArray(sd.attemptsByExecution[executionId])) sd.attemptsByExecution[executionId] = [];\n\nlet attempt;\nlet ok = false;\nlet outcome;\n\nif (result.ok === true && result.challenge_cleared === true) {\n  ok = true;\n  outcome = 'ok';\n  attempt = { proxy: via, result: 'ok', waited_ms: result.waited_ms, detected_by: result.detected_by };\n} else if (result.ok === true && result.challenge_cleared === false) {\n  outcome = 'challenge';\n  attempt = { proxy: via, result: 'challenge', detected_by: result.detected_by, waited_ms: result.waited_ms };\n} else if (typeof result.error === 'string') {\n  outcome = mapOutcome(result.error, result.detail);\n  attempt = { proxy: via, result: result.error, detail: String(result.detail || '').slice(0, 200) };\n} else if (result.error && typeof result.error === 'object') {\n  const msg = String(result.error.message || result.error.code || 'request failed').slice(0, 200);\n  outcome = 'target_error';\n  attempt = { proxy: via, result: 'request_failed', detail: msg };\n} else {\n  outcome = 'target_error';\n  attempt = { proxy: via, result: 'unknown_response' };\n}\n\nsd.attemptsByExecution[executionId].push(attempt);\n\n// outcome / proxy_id / url / ms / waited_ms / detected_by / http_status_raw\n// нужны только write-ветками, Collect их не читает.\nreturn [{\n  json: {\n    final: ok,\n    proxy: via,\n    title: ok ? result.title : null,\n    http_status: ok ? result.http_status : null,\n    html: ok ? result.html : null,\n    outcome: outcome,\n    proxy_id: current.proxy_id || null,\n    domain: state.domain,\n    url: state.url,\n    ms: typeof current.ms === 'number' ? current.ms : null,\n    waited_ms: typeof result.waited_ms === 'number' ? result.waited_ms : null,\n    detected_by: result.detected_by || null,\n    http_status_raw: typeof result.http_status === 'number' ? result.http_status : null,\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1232,
-        0
+        2720,
+        2800
       ],
-      "id": "b1000000-0000-4000-8000-000000000009",
+      "id": "75b9bcb2-d68d-4e08-bbb5-8f9954434fe9",
       "name": "Classify"
     },
     {
@@ -163,10 +146,10 @@
       "type": "n8n-nodes-base.splitInBatches",
       "typeVersion": 3,
       "position": [
-        1232,
-        200
+        3312,
+        2800
       ],
-      "id": "b1000000-0000-4000-8000-000000000012",
+      "id": "b19bfd9b-3863-4af6-aa2b-0944d6b0689b",
       "name": "Loop Over Items"
     },
     {
@@ -195,38 +178,178 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.3,
       "position": [
-        1456,
-        0
+        3008,
+        3120
       ],
-      "id": "b1000000-0000-4000-8000-000000000013",
+      "id": "5835e5a0-9565-43ae-9cc1-6ac2e2d9ebdb",
       "name": "Success?"
     },
     {
       "parameters": {
-        "jsCode": "const state = $('Combine').first().json;\n\nconst sd = $getWorkflowStaticData('global');\nconst attempts = Array.isArray(sd.attempts) ? sd.attempts : [];\nsd.attempts = [];\n\nconst items = $input.all().map((i) => i.json || {});\nconst success = items.find((j) => j && j.final === true) || null;\n\nreturn [{\n  json: {\n    ok: !!success,\n    url: state.url,\n    domain: state.domain,\n    error: success ? null : 'all_attempts_failed',\n    title: success ? success.title : null,\n    http_status: success ? success.http_status : null,\n    html: success ? success.html : null,\n    attempts: attempts,\n  },\n}];"
+        "jsCode": "const state = $('Combine').first().json;\n\nconst sd = $getWorkflowStaticData('global');\nconst executionId = String($execution.id);\nconst attempts = Array.isArray(sd.attemptsByExecution?.[executionId])\n  ? sd.attemptsByExecution[executionId]\n  : [];\ndelete sd.attemptsByExecution?.[executionId];\n\nconst items = $input.all().map((i) => i.json || {});\nconst success = items.find((j) => j && j.final === true) || null;\n\nreturn [{\n  json: {\n    ok: !!success,\n    url: state.url,\n    domain: state.domain,\n    error: success ? null : 'all_attempts_failed',\n    title: success ? success.title : null,\n    http_status: success ? success.http_status : null,\n    html: success ? success.html : null,\n    attempts: attempts,\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1680,
-        0
+        3792,
+        3360
       ],
-      "id": "b1000000-0000-4000-8000-000000000014",
+      "id": "a62f3248-bd59-4ccb-befc-b5fd1d865b7f",
       "name": "Collect"
+    },
+    {
+      "parameters": {
+        "jsCode": "try {\n  const res = $input.first().json || {};\n  const results = Array.isArray(res.results) ? res.results : [];\n  const state = $('Combine').first().json;\n\n  const IP4 = /^(?:\\d{1,3}\\.){3}\\d{1,3}$/;\n  const IP6 = /^[0-9a-fA-F:]{2,45}$/;\n  const CODES = ['connect_timeout', 'read_timeout', 'refused', 'reset', 'dns', 'tls', 'timeout', 'other'];\n\nfunction sqlStr(v) {\n  if (v === null || v === undefined) return 'NULL';\n  return \"'\" + String(v)\n    .replace(/\\\\/g, '\\\\\\\\')\n    .replace(/'/g, \"\\\\'\")\n    .replace(/\\0/g, '\\\\0')\n    .replace(/\\n/g, '\\\\n')\n    .replace(/\\r/g, '\\\\r')\n    .replace(/\\x1a/g, '\\\\Z') + \"'\";\n}\n\n  const bare = (s) => String(s || '').replace(/^[a-z]+:\\/\\//i, '');\n\n  const byIp = new Map();\n  for (const c of state.candidates) {\n    byIp.set(bare(c.ip), c.id);\n  }\n\n  const out = [];\n  for (const r of results) {\n    if (!r) continue;\n\n    const idNum = Number(byIp.get(bare(r.proxy)));\n    if (!isFinite(idNum) || idNum <= 0) continue;\n\n    const good = (r.ok === true || r.reachable === true) ? 1 : 0;\n\n    // exit_ip приходит из ответа api.ipify.org / icanhazip.com — это НЕдоверенный\n    // ввод (app.py берёт строку из JSON до 64 символов без проверки). Пропускаем\n    // только то, что реально похоже на IPv4/IPv6, иначе NULL.\n    let exitIp = null;\n    const raw = typeof r.exit_ip === 'string' ? r.exit_ip.trim() : '';\n    if (raw && (IP4.test(raw) || (raw.indexOf(':') !== -1 && IP6.test(raw)))) {\n      exitIp = raw;\n    }\n\n    let code = 'other';\n    const rawCode = typeof r.error_code === 'string' ? r.error_code : '';\n    if (CODES.indexOf(rawCode) !== -1) code = rawCode;\n\n    const msNum = typeof r.ms === 'number' && isFinite(r.ms) ? Math.round(r.ms) : null;\n\n    out.push({\n      json: {\n        id: idNum,\n        good: good,\n        ms_sql: msNum === null ? 'NULL' : String(msNum),\n        exit_ip_sql: exitIp === null ? 'NULL' : sqlStr(exitIp),\n        err_sql: good === 1 ? 'NULL' : sqlStr(code),\n      },\n    });\n  }\n  // Даже если проверка не вернула ни одного прокси, отдаём безопасный no-op UPDATE (id=0).\n  return out.length ? out : [{ json: { id: 0, good: 0, ms_sql: 'NULL', exit_ip_sql: 'NULL', err_sql: 'NULL' } }];\n} catch (e) {\n  return [{ json: { id: 0, good: 0, ms_sql: 'NULL', exit_ip_sql: 'NULL', err_sql: 'NULL' } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3568,
+        2352
+      ],
+      "id": "7f0248a3-2113-4aca-98f5-48c626fb58f5",
+      "name": "Prep proxy health"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE proxy_lst SET\n  checked_at = NOW(),\n  status     = CASE WHEN {{ $json.good }} = 1 THEN 1\n                    WHEN fail_conn + 1 >= 5\n                         AND (last_ok_at IS NULL OR last_ok_at < NOW() - INTERVAL 24 HOUR) THEN 10\n                    ELSE 9 END,\n  fail_conn  = CASE WHEN {{ $json.good }} = 1 THEN 0 ELSE fail_conn + 1 END,\n  ok_count   = CASE WHEN {{ $json.good }} = 1 THEN ok_count + 1 ELSE ok_count END,\n  last_ok_at = CASE WHEN {{ $json.good }} = 1 THEN NOW() ELSE last_ok_at END,\n  last_error = CASE WHEN {{ $json.good }} = 1 THEN NULL ELSE {{ $json.err_sql }} END,\n  ms         = CASE WHEN {{ $json.good }} = 1 AND {{ $json.ms_sql }} IS NOT NULL\n                    THEN {{ $json.ms_sql }} ELSE ms END,\n  exit_ip    = CASE WHEN {{ $json.exit_ip_sql }} IS NULL THEN exit_ip ELSE {{ $json.exit_ip_sql }} END,\n  leaked     = CASE WHEN {{ $json.exit_ip_sql }} IS NULL THEN leaked\n                    WHEN {{ $json.exit_ip_sql }} = SUBSTRING_INDEX(ip, ':', 1) THEN 1\n                    ELSE 0 END\nWHERE id = {{ $json.id }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        3776,
+        2352
+      ],
+      "id": "2b46b05a-4879-4836-8612-9142a068db91",
+      "name": "Save proxy health",
+      "executeOnce": false,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "try {\n  const c = $input.first().json || {};\n\n  const pid = Number(c.proxy_id);\n  if (!c.proxy_id || !isFinite(pid) || pid <= 0) return [{ json: { domain: '', proxy_id: 0, ok: 0, bad: 0, err_sql: 'NULL' } }];\n  if (!/^[a-z0-9.-]+$/.test(String(c.domain || ''))) return [{ json: { domain: '', proxy_id: 0, ok: 0, bad: 0, err_sql: 'NULL' } }];\n\n  // ok      = антибот пустил;\n  // bad     = челлендж, то есть именно домен не пустил этот прокси.\n  // Сетевые ошибки прокси (proxy_error/timeout) сюда НЕ входят: они пишутся\n  // в proxy_lst, иначе fail_count выкинет прокси из-за обрыва связи.\n  const ok = c.outcome === 'ok' ? 1 : 0;\n  const bad = c.outcome === 'challenge' ? 1 : 0;\n\n  return [{\n    json: {\n      domain: String(c.domain),\n      proxy_id: pid,\n      ok: ok,\n      bad: bad,\n      err_sql: bad === 1 ? \"'challenge'\" : 'NULL',\n    },\n  }];\n} catch (e) {\n  return [{ json: { domain: '', proxy_id: 0, ok: 0, bad: 0, err_sql: 'NULL' } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3696,
+        2720
+      ],
+      "id": "df8c7be8-ab17-4728-a219-d4daaebc2d02",
+      "name": "Prep site stats"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO site_proxy_stats\n  (domain, proxy_id, ok_count, fail_count, last_ok_at, last_used_at, cooldown_until, last_error)\nSELECT '{{ $json.domain }}', {{ $json.proxy_id }}, {{ $json.ok }}, {{ $json.bad }},\n       CASE WHEN {{ $json.ok }} = 1 THEN NOW() END,\n       NOW(),\n       CASE WHEN {{ $json.bad }} = 1 THEN NOW() + INTERVAL 30 MINUTE END,\n       {{ $json.err_sql }}\nWHERE {{ $json.proxy_id }} > 0\nON DUPLICATE KEY UPDATE\n  ok_count       = ok_count + {{ $json.ok }},\n  fail_count     = CASE WHEN {{ $json.ok }} = 1 THEN 0 ELSE fail_count + {{ $json.bad }} END,\n  last_ok_at     = CASE WHEN {{ $json.ok }} = 1 THEN NOW() ELSE last_ok_at END,\n  last_used_at   = NOW(),\n  cooldown_until = CASE WHEN {{ $json.ok }} = 1 THEN NULL ELSE cooldown_until END,\n  last_error     = CASE WHEN {{ $json.ok }} = 1 THEN NULL\n                        ELSE COALESCE({{ $json.err_sql }}, last_error) END",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        3920,
+        2736
+      ],
+      "id": "d33c112b-b7a5-4c80-bd3f-4eae97cf09a8",
+      "name": "Save site stats",
+      "executeOnce": false,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "try {\n  const c = $input.first().json || {};\n\n  const pid = Number(c.proxy_id);\n  // proxy_log.proxy_id — INT UNSIGNED NOT NULL, попытку direct логировать некуда\n  if (!c.proxy_id || !isFinite(pid) || pid <= 0) return [{ json: { proxy_id: 0, domain: '', url_sql: 'NULL', result: 'target_error', http_sql: 'NULL', waited_sql: 'NULL', detected_sql: 'NULL', ms_sql: 'NULL' } }];\n  if (!/^[a-z0-9.-]+$/.test(String(c.domain || ''))) return [{ json: { proxy_id: 0, domain: '', url_sql: 'NULL', result: 'target_error', http_sql: 'NULL', waited_sql: 'NULL', detected_sql: 'NULL', ms_sql: 'NULL' } }];\n\n  const RESULTS = ['ok', 'challenge', 'proxy_error', 'target_error', 'timeout'];\n  const result = RESULTS.indexOf(c.outcome) !== -1 ? c.outcome : 'target_error';\n\nfunction sqlStr(v) {\n  if (v === null || v === undefined) return 'NULL';\n  return \"'\" + String(v)\n    .replace(/\\\\/g, '\\\\\\\\')\n    .replace(/'/g, \"\\\\'\")\n    .replace(/\\0/g, '\\\\0')\n    .replace(/\\n/g, '\\\\n')\n    .replace(/\\r/g, '\\\\r')\n    .replace(/\\x1a/g, '\\\\Z') + \"'\";\n}\n\n  const httpStatus = typeof c.http_status_raw === 'number' ? Math.round(c.http_status_raw) : null;\n  const waitedMs = typeof c.waited_ms === 'number' ? Math.round(c.waited_ms) : null;\n  const ms = typeof c.ms === 'number' ? Math.round(c.ms) : null;\n  const detected = (typeof c.detected_by === 'string' && /^[a-z0-9_]{1,32}$/.test(c.detected_by))\n    ? c.detected_by\n    : null;\n\n  return [{\n    json: {\n      proxy_id: pid,\n      domain: String(c.domain),\n      url_sql: sqlStr(String(c.url || '').slice(0, 1024)),\n      result: result,\n      http_sql: httpStatus === null ? 'NULL' : String(httpStatus),\n      waited_sql: waitedMs === null ? 'NULL' : String(waitedMs),\n      detected_sql: detected === null ? 'NULL' : sqlStr(detected),\n      ms_sql: ms === null ? 'NULL' : String(ms),\n    },\n  }];\n} catch (e) {\n  return [{ json: { proxy_id: 0, domain: '', url_sql: 'NULL', result: 'target_error', http_sql: 'NULL', waited_sql: 'NULL', detected_sql: 'NULL', ms_sql: 'NULL' } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3696,
+        2944
+      ],
+      "id": "3366858c-d26d-4423-9f65-95526c4e5f94",
+      "name": "Prep attempt log"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO proxy_log\n  (proxy_id, domain, url, result, http_status, waited_ms, detected_by, ms)\nSELECT {{ $json.proxy_id }}, '{{ $json.domain }}', {{ $json.url_sql }}, '{{ $json.result }}',\n       {{ $json.http_sql }}, {{ $json.waited_sql }}, {{ $json.detected_sql }}, {{ $json.ms_sql }}\nWHERE {{ $json.proxy_id }} > 0",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        3904,
+        2944
+      ],
+      "id": "a23b87df-1b16-4969-abed-c94bf4117089",
+      "name": "Save attempt log",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "153bdb2a-bd75-4060-98d7-889e246b6561",
+              "name": "url",
+              "value": "={{ $json.url }}",
+              "type": "string"
+            },
+            {
+              "id": "93a78071-8afa-4586-a25d-761257727e55",
+              "name": "html",
+              "value": "={{ $json.html }}",
+              "type": "string"
+            },
+            {
+              "id": "d51e77f9-795e-4352-aba6-ae1a25db8570",
+              "name": "error",
+              "value": "={{ $json.error }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        4136,
+        3520
+      ],
+      "id": "5f8d8ab3-540b-486b-ae7c-e67750aa7f4b",
+      "name": "final",
+      "executeOnce": false
+    },
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "url"
+            },
+            {
+              "name": "max_attempts",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        2240,
+        2432
+      ],
+      "id": "88109f27-5757-4724-bd86-6f28e174076b",
+      "name": "When Executed by Another Workflow"
     }
   ],
   "connections": {
-    "When Executed by Another Workflow": {
-      "main": [
-        [
-          {
-            "node": "Init",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Init": {
       "main": [
         [
@@ -278,6 +401,11 @@
             "node": "Filter alive",
             "type": "main",
             "index": 0
+          },
+          {
+            "node": "Prep proxy health",
+            "type": "main",
+            "index": 0
           }
         ]
       ]
@@ -287,24 +415,6 @@
         [
           {
             "node": "Loop Over Items",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Loop Over Items": {
-      "main": [
-        [
-          {
-            "node": "Collect",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Scrape",
             "type": "main",
             "index": 0
           }
@@ -329,6 +439,34 @@
             "node": "Success?",
             "type": "main",
             "index": 0
+          },
+          {
+            "node": "Prep site stats",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prep attempt log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Collect",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Scrape",
+            "type": "main",
+            "index": 0
           }
         ]
       ]
@@ -350,10 +488,71 @@
           }
         ]
       ]
+    },
+    "Collect": {
+      "main": [
+        [
+          {
+            "node": "final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep proxy health": {
+      "main": [
+        [
+          {
+            "node": "Save proxy health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep site stats": {
+      "main": [
+        [
+          {
+            "node": "Save site stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep attempt log": {
+      "main": [
+        [
+          {
+            "node": "Save attempt log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Init",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "ylI95YFnyB8HdrFl",
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 900,
+    "availableInMCP": false
   },
   "pinData": {}
 }
